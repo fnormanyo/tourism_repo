@@ -1,0 +1,183 @@
+# Workflow name displayed in the GitHub Actions dashboard
+name: Tourism Project Pipeline
+
+# Events that trigger this workflow
+on:
+  # Run automatically whenever code is pushed to the main branch
+  push:
+    branches:
+      - main
+
+  # Allow a user to manually start the workflow from the Actions tab
+  workflow_dispatch:
+
+# Prevent simultaneous workflow runs from attempting to commit to main.
+# Running jobs are allowed to complete; later jobs wait their turn.
+concurrency:
+  group: tourism-project-main-model-update
+  cancel-in-progress: false
+
+# Grants the workflow permission to push the trained model back to the repository
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # JOB 1: Register Dataset
+  # Downloads/registers the dataset and makes it available to later jobs
+  # through a GitHub Actions artifact.
+  # ---------------------------------------------------------------------------
+  register-dataset:
+    # Friendly job name shown in the GitHub Actions interface
+    name: Register Dataset
+
+    # Use the latest Ubuntu-hosted GitHub Actions runner
+    runs-on: ubuntu-latest
+
+    steps:
+      # Checks out the repository code so workflow scripts are available
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Installs Python 3.11 on the runner
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Installs project libraries listed in the requirements file
+      - name: Install dependencies
+        run: pip install -r tourism_project/requirements.txt
+
+      # Runs the Python script that obtains or registers the source dataset
+      - name: Register dataset
+        run: python tourism_project/model_building/data_register.py
+
+      # Stores the registered dataset as an artifact
+      - name: Upload registered dataset
+        uses: actions/upload-artifact@v4
+        with:
+          name: registered-data
+          path: tourism_project/data/tourism.csv
+
+  # ---------------------------------------------------------------------------
+  # JOB 2: Data Preparation
+  # Cleans/transforms data and creates training and test datasets.
+  # ---------------------------------------------------------------------------
+  data-preparation:
+    name: Data Preparation
+
+    # This job only starts after register-dataset completes successfully
+    needs: register-dataset
+
+    runs-on: ubuntu-latest
+
+    steps:
+      # Retrieves repository code and workflow scripts
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Configures the required Python runtime
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Installs the Python packages required by prep.py
+      - name: Install dependencies
+        run: pip install -r tourism_project/requirements.txt
+
+      # Runs data cleaning, feature preparation, and train/test splitting
+      - name: Prepare data
+        run: python tourism_project/model_building/prep.py
+
+      # Saves output split files so the model-training job can retrieve them
+      - name: Upload train/test splits
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-splits
+          path: |
+            Xtrain.csv
+            Xtest.csv
+            ytrain.csv
+            ytest.csv
+
+  # ---------------------------------------------------------------------------
+  # JOB 3: Model Training and MLflow Experiment Tracking
+  # Downloads prepared data, runs model training, tracks experiments in MLflow,
+  # and commits the selected model artifact back to the repository.
+  # ---------------------------------------------------------------------------
+  model-training:
+    name: Model Training
+
+    # This job runs only after data preparation completes successfully
+    needs: data-preparation
+
+    runs-on: ubuntu-latest
+
+    steps:
+      # Fetch all Git history. This is required for git pull --rebase
+      # and protects against non-fast-forward push errors.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      # Sets up the Python interpreter used for model training
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Installs MLflow, scikit-learn, and other project dependencies
+      - name: Install dependencies
+        run: pip install -r tourism_project/requirements.txt
+
+      # Downloads the data-splits artifact created in the data-preparation job
+      - name: Download train/test splits
+        uses: actions/download-artifact@v4
+        with:
+          name: data-splits
+
+      # Starts a local MLflow tracking UI/server in the background
+      - name: Start MLflow tracking server
+        run: |
+          nohup mlflow ui --host 0.0.0.0 --port 5000 &
+          sleep 5
+
+      # Trains the tourism model and records metrics/artifacts in MLflow
+      - name: Train model with MLflow tracking
+        run: python tourism_project/model_building/train.py
+
+      # Pulls any remote commits created after this workflow began,
+      # commits the new model only if it changed, and pushes safely.
+      - name: Commit trained model
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git pull --rebase origin main
+
+          git add tourism_project/deployment/best_tourism_model_v0.joblib
+
+          if git diff --cached --quiet; then
+            echo "No trained-model changes detected. Nothing to commit."
+            exit 0
+          fi
+
+          git commit -m "Add trained model [skip ci]"
+
+          for attempt in 1 2 3; do
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              echo "Trained model pushed successfully."
+              exit 0
+            fi
+
+            echo "Push attempt ${attempt} failed because main changed. Retrying..."
+            git rebase --abort || true
+            sleep 5
+          done
+
+          echo "Unable to push the trained model after three attempts."
+          exit 1
